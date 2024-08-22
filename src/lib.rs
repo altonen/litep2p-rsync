@@ -37,7 +37,9 @@ use tokio::{
 
 use std::{
     collections::{hash_map::Entry, HashMap},
-    io::Cursor,
+    fs::File,
+    io::{Cursor, Read},
+    path::PathBuf,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -68,13 +70,33 @@ pub enum RsyncEvent {
     },
 }
 
+enum FutureEvent {
+    Request {
+        peer: PeerId,
+        diff_id: DiffId,
+        path: PathBuf,
+        digest: Vec<u8>,
+        signature: Vec<u8>,
+    },
+
+    ResponseOut {
+        request_id: RequestId,
+        delta: Vec<u8>,
+    },
+
+    ResponseIn {
+        diff_id: DiffId,
+        data: Vec<u8>,
+    },
+}
+
 /// Handle for communicating with [`Rsync`].
 pub struct Rsync {
-    futures: JoinSet<Result<(DiffId, Vec<u8>, Vec<u8>), ()>>,
+    futures: JoinSet<Result<FutureEvent, ()>>,
     handle: RequestResponseHandle,
     next_diff_id: u64,
     pending_diffs: HashMap<RequestId, Vec<u8>>,
-    pending_out_diffs: HashMap<RequestId, (DiffId, Vec<u8>)>,
+    pending_out_diffs: HashMap<RequestId, (DiffId, PathBuf)>,
 }
 
 impl Rsync {
@@ -110,97 +132,140 @@ impl Rsync {
         Some((bytes, signature))
     }
 
-    fn on_response(&mut self, request_id: RequestId, bytes: Vec<u8>) -> Option<(DiffId, Vec<u8>)> {
-        let (diff_id, orig) = self.pending_out_diffs.remove(&request_id)?;
+    fn on_response(&mut self, request_id: RequestId, delta: Vec<u8>) {
+        let (diff_id, path) = self.pending_out_diffs.remove(&request_id).unwrap();
 
-        let mut out = Vec::new();
-        patch(&mut Cursor::new(orig), &mut Cursor::new(bytes), &mut out).unwrap();
+        self.futures.spawn_blocking(move || {
+            let mut contents = Vec::new();
+            let mut file = File::open(&path).map_err(|_| ())?;
+            file.read_to_end(&mut contents).map_err(|_| ())?;
 
-        Some((diff_id, out))
+            let mut data = Vec::new();
+            patch(
+                &mut Cursor::new(contents),
+                &mut Cursor::new(delta),
+                &mut data,
+            )
+            .map_err(|_| ())
+            .map(|_| FutureEvent::ResponseIn { diff_id, data })
+        });
     }
 
-    fn calculate_diff_info<T: AsRef<[u8]>>(bytes: T) -> Result<(Vec<u8>, Vec<u8>), ()> {
-        let digest = {
-            let mut hasher = Sha256::new();
-            hasher.update(bytes.as_ref());
-            hasher.finalize().to_vec()
-        };
-        let signature = {
-            let mut sig = Vec::new();
-
-            signature(&mut Cursor::new(bytes.as_ref()), &mut sig)
-                .map_err(|_| ())
-                .map(|_| sig)
-        }?;
-
-        Ok((digest, signature))
-    }
-
-    pub fn download_diff_blocking<T: AsRef<[u8]>>(
-        &mut self,
-        peer: PeerId,
-        bytes: T,
-    ) -> Result<DiffId, ()> {
-        let diff_id = self.next_diff_id();
-        let (digest, signature) = Self::calculate_diff_info(&bytes)?;
-        let serialized = {
-            let mut out = BytesMut::with_capacity(digest.len() + signature.len());
-            out.put_slice(&digest);
-            out.put_slice(&signature);
-
-            out
-        };
-
-        match self
-            .handle
-            .try_send_request(peer, serialized.freeze().to_vec(), DialOptions::Dial)
-        {
-            Err(_) => Err(()),
-            Ok(request_id) => {
-                println!("request sent");
-                self.pending_out_diffs
-                    .insert(request_id, (diff_id, bytes.as_ref().to_vec()));
-                Ok(diff_id)
-            }
-        }
-    }
-
-    pub fn send_diff_response_blocking<T: AsRef<[u8]>>(&mut self, request_id: RequestId, bytes: T) {
+    pub fn send_diff_response(&mut self, request_id: RequestId, path: PathBuf) {
         let signature = self.pending_diffs.remove(&request_id).unwrap();
 
-        let mut dlt = Vec::new();
-        delta(
-            &mut Cursor::new(bytes),
-            &mut Cursor::new(signature),
-            &mut dlt,
-        )
-        .unwrap();
+        self.futures.spawn_blocking(move || {
+            let mut contents = Vec::new();
+            let mut file = File::open(&path).map_err(|_| ())?;
+            file.read_to_end(&mut contents).map_err(|_| ())?;
 
-        self.handle.send_response(request_id, dlt);
+            println!("modified len = {}", contents.len());
+
+            let mut dlt = Vec::new();
+            delta(
+                &mut Cursor::new(contents),
+                &mut Cursor::new(signature),
+                &mut dlt,
+            )
+            .map_err(|_| ())
+            .map(|_| {
+                println!("delta len = {}", dlt.len());
+
+                FutureEvent::ResponseOut {
+                    request_id,
+                    delta: dlt,
+                }
+            })
+        });
     }
 
-    // pub fn download_diff(&mut self, bytes: Vec<u8>) -> DiffId {
-    //     let diff_id = self.next_diff_id();
+    pub fn download_diff(&mut self, peer: PeerId, path: PathBuf) -> DiffId {
+        let diff_id = self.next_diff_id();
 
-    //     self.futures.spawn_blocking(move || {
-    //         Self::calculate_diff_info(bytes).map(|(digest, signature)| (diff_id, digest, signature))
-    //     });
+        self.futures.spawn_blocking(move || {
+            let mut contents = Vec::new();
+            let mut file = File::open(&path).map_err(|_| ())?;
+            file.read_to_end(&mut contents).map_err(|_| ())?;
 
-    //     diff_id
-    // }
+            println!("original len = {}", contents.len());
+
+            let digest = {
+                let mut hasher = Sha256::new();
+                hasher.update(&contents);
+                hasher.finalize().to_vec()
+            };
+            let signature = {
+                let mut sig = Vec::new();
+
+                signature(&mut Cursor::new(&contents), &mut sig)
+                    .map_err(|_| ())
+                    .map(|_| {
+                        println!("signature len = {}", sig.len());
+                        sig
+                    })
+            }?;
+
+            println!("ready!");
+
+            Ok(FutureEvent::Request {
+                peer,
+                diff_id,
+                path,
+                digest,
+                signature,
+            })
+        });
+
+        diff_id
+    }
 }
 
 impl Stream for Rsync {
     type Item = RsyncEvent;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // loop {
-        //     match self.futures.poll_join_next(cx) {
-        //         Poll::Pending => break,
-        //         Poll::Ready(None) | Poll::Ready(Some(Err(_))) => return Poll::Ready(None),
-        //         Poll::Ready(Some(Ok(_))) => todo!(),
-        //     }
-        // }
+        loop {
+            match self.futures.poll_join_next(cx) {
+                Poll::Pending | Poll::Ready(None) => break,
+                Poll::Ready(Some(Err(_))) => return Poll::Ready(None),
+                Poll::Ready(Some(Ok(Ok(FutureEvent::Request {
+                    peer,
+                    diff_id,
+                    path,
+                    digest,
+                    signature,
+                })))) => {
+                    let serialized = {
+                        let mut out = BytesMut::with_capacity(digest.len() + signature.len());
+                        out.put_slice(&digest);
+                        out.put_slice(&signature);
+
+                        out
+                    };
+
+                    match self.handle.try_send_request(
+                        peer,
+                        serialized.freeze().to_vec(),
+                        DialOptions::Dial,
+                    ) {
+                        Err(_) => {}
+                        Ok(request_id) => {
+                            self.pending_out_diffs.insert(request_id, (diff_id, path));
+                        }
+                    }
+                }
+                Poll::Ready(Some(Ok(Ok(FutureEvent::ResponseOut { request_id, delta })))) => {
+                    self.handle.send_response(request_id, delta);
+                }
+                Poll::Ready(Some(Ok(Ok(FutureEvent::ResponseIn { diff_id, data })))) => {
+                    return Poll::Ready(Some(RsyncEvent::DiffResponseReceived {
+                        diff_id,
+                        file: data,
+                    }))
+                }
+                _ => todo!(),
+            }
+        }
 
         loop {
             match futures::ready!(self.handle.poll_next_unpin(cx)) {
@@ -225,15 +290,7 @@ impl Stream for Rsync {
                         request_id,
                         fallback,
                         response,
-                    } => match self.on_response(request_id, response) {
-                        None => {}
-                        Some((diff_id, bytes)) => {
-                            return Poll::Ready(Some(RsyncEvent::DiffResponseReceived {
-                                diff_id,
-                                file: bytes,
-                            }))
-                        }
-                    },
+                    } => self.on_response(request_id, response),
                     RequestResponseEvent::RequestFailed {
                         peer,
                         request_id,
@@ -282,30 +339,50 @@ mod tests {
             }
         });
 
-        let mut original = "hello, world!".as_bytes();
-        let mut modified = "goodbye, world!".as_bytes();
+        let mut original = PathBuf::from("resources/Cargo.lock");
+        let mut modified = PathBuf::from("resources/Cargo.lock.cpy");
 
-        let diff_id = rsync1.download_diff_blocking(peer2, original);
+        let modified_digest = {
+            let mut file = File::open(&modified).unwrap();
+            let mut contents = Vec::new();
+            file.read_to_end(&mut contents).unwrap();
 
-        println!("diff id = {diff_id:?}");
+            let mut hasher = Sha256::new();
+            hasher.update(&contents);
+            hasher.finalize().to_vec()
+        };
 
-        match rsync2.next().await.unwrap() {
-            RsyncEvent::DiffRequestReceived { request_id, digest } => {
-                rsync2.send_diff_response_blocking(request_id, &modified);
+        tokio::spawn(async move {
+            match rsync2.next().await.unwrap() {
+                RsyncEvent::DiffRequestReceived { request_id, digest } => {
+                    println!("send diff repsonse");
+                    rsync2.send_diff_response(request_id, modified);
+                }
+                _ => todo!(),
             }
-            _ => todo!(),
-        }
 
-        match rsync1.next().await.unwrap() {
-            RsyncEvent::DiffResponseReceived { diff_id, file } => {
-                println!(
-                    "response for {diff_id:?} = {:?}",
-                    std::str::from_utf8(&file)
-                );
+            loop {
+                let _ = rsync2.next().await.unwrap();
             }
-            _ => todo!(),
-        }
+        });
 
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let diff_id = rsync1.download_diff(peer2, original);
+
+        loop {
+            while let Some(event) = rsync1.next().await {
+                match event {
+                    RsyncEvent::DiffResponseReceived { diff_id, file } => {
+                        let mut hasher = Sha256::new();
+                        hasher.update(&file);
+                        let digest = hasher.finalize().to_vec();
+                        assert_eq!(digest, modified_digest);
+
+                        println!("matches");
+                        return;
+                    }
+                    _ => todo!(),
+                }
+            }
+        }
     }
 }
