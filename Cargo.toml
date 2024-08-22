@@ -1,0 +1,17 @@
+[package]
+name = "litep2p-rsync"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+async-trait = "0.1.81"
+bytes = "1.7.1"
+futures = "0.3.30"
+librsync = "0.2.3"
+litep2p = "0.6.2"
+sha2 = "0.10.8"
+tokio = { version = "1.39.3", features = ["full"] }
+tracing = { version = "0.1.40", features = ["log"] }
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
